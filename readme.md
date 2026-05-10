@@ -60,7 +60,7 @@ contact_bot/
 
 ### Graph Flow
 
-![LangGraph workflow diagram](static/graph.png)
+![LangGraph workflow diagram](graph.png)
 
 The graph collects fields in a fixed order — name → phone → email → description. After each user message, `llm_node` either advances to the next `ask_*` node (on success) or loops back to the same one (on failure). The `complete` node runs only when all four fields have been validated.
 
