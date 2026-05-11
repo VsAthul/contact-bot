@@ -143,9 +143,7 @@ def _instruction_off_topic(field: str, raw_input: str, collected: dict) -> str:
     )
 
 
-# --------------------------------------------------------------------------
 # Node function
-# --------------------------------------------------------------------------
 
 def llm_node(state: ContactBotState) -> ContactBotState:
     """
