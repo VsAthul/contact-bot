@@ -2,6 +2,32 @@
 Flask application for the Incede contact bot.
 Provides REST API endpoints for session management, chat processing,
 and log retrieval. Integrates with the LangGraph workflow and SQLite database.
+
+State persistence
+-----------------
+Conversation state is stored entirely through LangGraph's SqliteSaver
+checkpointer (keyed by thread_id == session_id).  There is no in-process
+dict of active sessions.  This means:
+
+  * Flask restarts and worker recycles never lose in-flight conversations.
+  * Multiple workers can serve the same session safely (SQLite WAL mode).
+
+Graph execution model
+---------------------
+The compiled graph uses interrupt_before=["llm_node"].  The two endpoints
+interact with the graph as follows:
+
+  POST /api/session/start
+    graph.invoke(initial_state, config={thread_id})
+    → runs ask_name, pauses before llm_node
+    → reads greeting from snapshot
+
+  POST /api/chat
+    graph.update_state(config, {raw_user_input, messages: [HumanMessage]})
+    graph.invoke(None, config)
+    → resumes from llm_node, runs validation + reply + next ask_* node
+    → pauses again before the next llm_node call (or reaches END if complete)
+    → reads latest bot message from snapshot
 """
 
 import traceback
@@ -25,8 +51,10 @@ from database import (
 app = Flask(__name__)
 app.secret_key = "incede_bot_secret_key_2024"
 
-# In-memory storage for active graph states (keyed by session_id)
-active_sessions: dict = {}
+
+def _thread_config(session_id: str) -> dict:
+    """Return the LangGraph config dict that identifies a conversation thread."""
+    return {"configurable": {"thread_id": session_id}}
 
 
 def _get_initial_state(session_id: str) -> dict:
@@ -78,23 +106,32 @@ def logs_page():
 def start_session():
     """
     Start a new chat session for the contact bot.
-    Calls ask_name which uses the LLM to generate the greeting message.
+
+    Runs the graph from START through ask_name.  The graph pauses before
+    llm_node (interrupt_before), so this call returns as soon as ask_name
+    has generated and persisted the greeting.  The checkpoint is written to
+    SQLite and survives any subsequent restart.
 
     Returns:
         JSON with session_id and the LLM-generated greeting from the bot.
     """
     try:
         session_id = create_session()
-        state = _get_initial_state(session_id)
+        config = _thread_config(session_id)
 
-        # ask_name generates the greeting via LLM on first call (empty messages list)
-        from graph import ask_name
-        initial_state = ask_name(state)
-        active_sessions[session_id] = initial_state
+        from graph import contact_bot_graph
+        initial_state = _get_initial_state(session_id)
 
+        # invoke runs ask_name then pauses at the interrupt_before=["llm_node"] boundary.
+        contact_bot_graph.invoke(initial_state, config)
+
+        # Read the persisted snapshot to extract the greeting.
+        snapshot = contact_bot_graph.get_state(config)
+        messages = snapshot.values.get("messages", [])
+        ai_messages = [m for m in messages if isinstance(m, AIMessage)]
         greeting = (
-            initial_state["messages"][-1].content
-            if initial_state["messages"]
+            ai_messages[-1].content
+            if ai_messages
             else "Hello! I am here to collect your contact details."
         )
 
@@ -114,7 +151,9 @@ def start_session():
 def stop_session():
     """
     End an active chat session.
-    Marks the session as ended in the database and removes the in-memory state.
+
+    Marks the session as ended in the database.  The checkpointer state is
+    left in place (it is read-only from this point and naturally expires).
 
     Request body:
         session_id (str): The session to end.
@@ -129,8 +168,17 @@ def stop_session():
         return jsonify({"error": "session_id is required"}), 400
 
     try:
-        state = active_sessions.pop(session_id, None)
-        contact_collected = state.get("is_complete", False) if state else False
+        # Read is_complete from the persisted checkpoint so we correctly mark
+        # the session even if the worker that created it has since restarted.
+        contact_collected = False
+        try:
+            from graph import contact_bot_graph
+            snapshot = contact_bot_graph.get_state(_thread_config(session_id))
+            if snapshot and snapshot.values:
+                contact_collected = bool(snapshot.values.get("is_complete", False))
+        except Exception:
+            # If reading the snapshot fails, fall back to marking as abandoned.
+            pass
 
         existing = get_session(session_id)
         if existing and existing.get("status") == "active":
@@ -155,15 +203,12 @@ def chat():
     Process a user message through the LangGraph workflow.
 
     Flow per request:
-      1. llm_node  — extracts + validates the user input and generates a reply
-                     for every invalid/off-topic/extraction-failure outcome.
-      2. route_after_llm — decides whether to advance or stay on current field.
-      3. Next ask_* node  — called ONLY when the field was valid, so it can
-                            generate the "acknowledged + next question" message.
-         complete_node    — called when all fields are done.
-
-    This means the ask_* nodes are NEVER called on an invalid submission,
-    preventing duplicate bot messages.
+      1. graph.update_state — injects the user's message and raw_user_input
+         into the persisted checkpoint so llm_node can read them when resumed.
+      2. graph.invoke(None, config) — resumes execution from the interrupt
+         point (llm_node), runs validation + reply generation, then runs the
+         next ask_* node (or complete_node), and pauses again.
+      3. Read the latest AIMessage from the updated snapshot and return it.
 
     Request body:
         session_id (str): The active session ID.
@@ -194,59 +239,52 @@ def chat():
         if session_record.get("status") != "active":
             return jsonify({"error": "Session is no longer active"}), 400
 
-        state = active_sessions.get(session_id)
-        if not state:
-            return jsonify({"error": "Session state not found. Please start a new session."}), 404
+        from graph import contact_bot_graph
+        config = _thread_config(session_id)
 
-        # Persist the user message and add it to the state
+        # Verify the checkpoint exists — it is missing only if the session was
+        # never started properly (e.g. direct DB insert without /session/start).
+        snapshot = contact_bot_graph.get_state(config)
+        if not snapshot or not snapshot.values:
+            return jsonify({
+                "error": "Session state not found. Please start a new session."
+            }), 404
+
+        # Persist the user message for the logs page.
         save_message(session_id, "user", user_message)
-        state["messages"] = state["messages"] + [HumanMessage(content=user_message)]
-        state["raw_user_input"] = user_message
 
-        from graph import (
-            llm_node, route_after_llm,
-            ask_phone, ask_email, ask_description, complete_node,
-        )
+        # Inject the user input into the checkpoint so llm_node can read it.
+        # update_state merges into the current snapshot; the add_messages
+        # reducer on ContactBotState.messages appends rather than replaces.
+        contact_bot_graph.update_state(config, {
+            "raw_user_input": user_message,
+            "messages": [HumanMessage(content=user_message)],
+        })
 
-        # Step 1: extract, validate, and generate a reply for invalid outcomes
-        state = llm_node(state)
+        # Resume execution from the interrupt point.  Passing None as input
+        # tells LangGraph to continue from where it paused.
+        contact_bot_graph.invoke(None, config)
 
-        # Step 2: decide the next node
-        next_node_name = route_after_llm(state)
+        # Read the updated snapshot to extract the bot's reply.
+        updated_snapshot = contact_bot_graph.get_state(config)
+        updated_values = updated_snapshot.values if updated_snapshot else {}
 
-        # Step 3: only run the next node when the current field was VALID.
-        # On invalid, llm_node already added the error reply — calling the
-        # ask_* node again would append a second, redundant bot message.
-        if state.get("is_valid"):
-            next_node_fn = {
-                # ask_name is intentionally excluded: if name re-validation
-                # somehow routes back, llm_node's message is sufficient.
-                "ask_phone": ask_phone,
-                "ask_email": ask_email,
-                "ask_description": ask_description,
-                "complete": complete_node,
-            }.get(next_node_name)
-
-            if next_node_fn:
-                state = next_node_fn(state)
-
-        # Persist updated state
-        active_sessions[session_id] = state
-
-        # Return the latest bot message
-        bot_messages = [m for m in state["messages"] if isinstance(m, AIMessage)]
+        ai_messages = [
+            m for m in updated_values.get("messages", [])
+            if isinstance(m, AIMessage)
+        ]
         latest_bot_message = (
-            bot_messages[-1].content if bot_messages else "I am processing your request."
+            ai_messages[-1].content
+            if ai_messages
+            else "I am processing your request."
         )
 
-        is_complete = state.get("is_complete", False)
-        if is_complete:
-            active_sessions.pop(session_id, None)
+        is_complete = bool(updated_values.get("is_complete", False))
 
         return jsonify({
             "message": latest_bot_message,
             "is_complete": is_complete,
-            "current_field": state.get("current_field"),
+            "current_field": updated_values.get("current_field"),
         }), 200
 
     except Exception as exc:
