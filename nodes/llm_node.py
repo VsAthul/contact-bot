@@ -6,6 +6,7 @@ Central LLM processing node — handles extraction, validation, and reply genera
 import re
 import traceback
 
+from flask import current_app
 from langchain_core.messages import AIMessage, HumanMessage
 
 from schema import (
@@ -24,6 +25,7 @@ from tools import (
     ALL_VALIDATION_TOOLS,
 )
 from database import save_message, log_error
+from utils.pii_scrubber import mask_email, mask_phone, mask_name, scrub
 
 
 # --------------------------------------------------------------------------
@@ -61,10 +63,16 @@ def _run_validation_via_llm(field: str, value: str) -> dict:
     validation_llm = get_validation_llm(ALL_VALIDATION_TOOLS)
     response = validation_llm.invoke([HumanMessage(content=prompt)])
 
-    print(f"DEBUG validation tool_calls='{response.tool_calls}'")
+    # Log tool_calls count only — the raw payload may contain PII
+    num_calls = len(response.tool_calls) if response.tool_calls else 0
+    current_app.logger.debug(
+        "validation tool_calls count=%d field='%s'", num_calls, field
+    )
 
     if not response.tool_calls:
-        print(f"WARNING: LLM did not call a tool for field='{field}', value='{value}'")
+        current_app.logger.warning(
+            "LLM did not call a tool for field='%s'", field
+        )
         return {
             "is_valid": False,
             "reason": "Validation could not be performed — please try again.",
@@ -74,11 +82,14 @@ def _run_validation_via_llm(field: str, value: str) -> dict:
     tool_name = tool_call["name"]
     tool_args = tool_call["args"]
 
-    print(f"DEBUG LLM chose tool='{tool_name}' with args='{tool_args}'")
+    # Scrub any PII that might appear in tool_args before logging
+    current_app.logger.debug(
+        "LLM chose tool='%s' args='%s'", tool_name, scrub(str(tool_args))
+    )
 
     tool_fn = tool_map.get(tool_name)
     if not tool_fn:
-        print(f"WARNING: LLM called unknown tool '{tool_name}'")
+        current_app.logger.warning("LLM called unknown tool '%s'", tool_name)
         return {
             "is_valid": False,
             "reason": f"Unknown validation tool called: {tool_name}",
@@ -143,7 +154,51 @@ def _instruction_off_topic(field: str, raw_input: str, collected: dict) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# PII-safe log helpers
+# --------------------------------------------------------------------------
+
+def _log_extracted(field: str, raw_input: str, extracted) -> None:
+    """Log extraction result with PII masked based on field type."""
+    safe_raw = scrub(raw_input)
+
+    if field == "email":
+        safe_value = mask_email(extracted.email) if (extracted.found and extracted.email) else "null"
+    elif field == "phone":
+        safe_value = mask_phone(extracted.phone) if (extracted.found and extracted.phone) else "null"
+    elif field == "name":
+        safe_value = mask_name(extracted.name) if (extracted.found and extracted.name) else "null"
+    else:
+        # description — not PII in the same sense, but still scrub it
+        desc = getattr(extracted, "description", None)
+        safe_value = scrub(desc) if desc else ("skipped" if getattr(extracted, "skipped", False) else "null")
+
+    current_app.logger.debug(
+        "extraction field='%s' raw_input='%s' extracted_value='%s'",
+        field, safe_raw, safe_value,
+    )
+
+
+def _log_extracted_value(field: str, value) -> None:
+    """Log the final extracted_value with PII masked."""
+    if field == "email" and value:
+        safe = mask_email(value)
+    elif field == "phone" and value:
+        safe = mask_phone(value)
+    elif field == "name" and value:
+        safe = mask_name(value)
+    else:
+        safe = scrub(str(value)) if value else repr(value)
+
+    length = len(value) if value else 0
+    current_app.logger.debug(
+        "extracted_value field='%s' value='%s' len=%d", field, safe, length
+    )
+
+
+# --------------------------------------------------------------------------
 # Node function
+# --------------------------------------------------------------------------
 
 def llm_node(state: ContactBotState) -> ContactBotState:
     """
@@ -242,8 +297,9 @@ def llm_node(state: ContactBotState) -> ContactBotState:
 
         structured_llm = get_structured_llm(schema)
         extracted = structured_llm.invoke(prompt)
-        print(f"DEBUG field='{current_field}' raw_input='{raw_input}'")
-        print(f"DEBUG extracted='{extracted}'")
+
+        # Log extraction result with PII masked
+        _log_extracted(current_field, raw_input, extracted)
 
         # ------------------------------------------------------------------
         # Step 3: Get the extracted value
@@ -279,7 +335,7 @@ def llm_node(state: ContactBotState) -> ContactBotState:
         # ------------------------------------------------------------------
         # Step 4: Validate via LLM tool calling
         # ------------------------------------------------------------------
-        print(f"DEBUG extracted_value='{extracted_value}' len={len(extracted_value) if extracted_value else 0}")
+        _log_extracted_value(current_field, extracted_value)
         validation_result = _run_validation_via_llm(current_field, extracted_value or "")
         is_valid = validation_result.get("is_valid", False)
         reason = validation_result.get("reason") or "The value did not pass validation."
