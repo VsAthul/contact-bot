@@ -29,7 +29,7 @@ The graph registers interrupt_before=["llm_node"].  This means:
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.sync import SqliteSaver
 
 from schema import ContactBotState
 from nodes import (
