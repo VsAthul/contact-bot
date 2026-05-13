@@ -1,39 +1,9 @@
-"""
-Flask application for the Incede contact bot.
-Provides REST API endpoints for session management, chat processing,
-and log retrieval. Integrates with the LangGraph workflow and SQLite database.
-
-State persistence
------------------
-Conversation state is stored entirely through LangGraph's SqliteSaver
-checkpointer (keyed by thread_id == session_id).  There is no in-process
-dict of active sessions.  This means:
-
-  * Flask restarts and worker recycles never lose in-flight conversations.
-  * Multiple workers can serve the same session safely (SQLite WAL mode).
-
-Graph execution model
----------------------
-The compiled graph uses interrupt_before=["llm_node"].  The two endpoints
-interact with the graph as follows:
-
-  POST /api/session/start
-    graph.invoke(initial_state, config={thread_id})
-    → runs ask_name, pauses before llm_node
-    → reads greeting from snapshot
-
-  POST /api/chat
-    graph.update_state(config, {raw_user_input, messages: [HumanMessage]})
-    graph.invoke(None, config)
-    → resumes from llm_node, runs validation + reply + next ask_* node
-    → pauses again before the next llm_node call (or reaches END if complete)
-    → reads latest bot message from snapshot
-"""
 
 import traceback
 from flask import Flask, request, jsonify, render_template
 from langchain_core.messages import HumanMessage, AIMessage
-
+import os
+from dotenv import load_dotenv
 import database
 from database import (
     init_db,
@@ -48,9 +18,12 @@ from database import (
     get_contact_detail,
 )
 
+load_dotenv()
 app = Flask(__name__)
-app.secret_key = "incede_bot_secret_key_2024"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 
+if not app.secret_key:
+    raise ValueError("FLASK_SECRET_KEY environment variable is not set")
 
 def _thread_config(session_id: str) -> dict:
     """Return the LangGraph config dict that identifies a conversation thread."""
@@ -387,4 +360,4 @@ def get_session_errors(session_id: str):
 
 if __name__ == "__main__":
     init_db()
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="127.0.0.1", port=5000)
