@@ -1,3 +1,4 @@
+import sqlite3
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
@@ -108,7 +109,8 @@ def build_graph():
     # the rest of the app.  The context-manager form keeps a single connection
     # open for the lifetime of the process; __exit__ is never called here
     # because this object lives for the full server lifetime.
-    checkpointer = SqliteSaver.from_conn_string(_CHECKPOINT_DB_PATH)
+    conn = sqlite3.connect(_CHECKPOINT_DB_PATH, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
 
     compiled = workflow.compile(
         checkpointer=checkpointer,

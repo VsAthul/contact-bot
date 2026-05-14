@@ -478,6 +478,11 @@ def llm_node(state: ContactBotState) -> ContactBotState:
 
         extraction_intent = getattr(extracted, "intent", "answer")
 
+# IMPORTANT:
+# description skip should bypass off-topic handling
+        if current_field == "description" and getattr(extracted, "skipped", False):
+             extraction_intent = "answer"
+
         if extraction_intent in {"question", "off_topic", "unclear"}:
 
             instruction = _instruction_off_topic(
