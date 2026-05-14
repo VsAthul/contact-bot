@@ -1,4 +1,3 @@
-
 import traceback
 from flask import Flask, request, jsonify, render_template
 from langchain_core.messages import HumanMessage, AIMessage
@@ -154,7 +153,11 @@ def stop_session():
             pass
 
         existing = get_session(session_id)
-        if existing and existing.get("status") == "active":
+        # FIX: Guard against calling end_session a second time when complete_node
+        # has already marked the session as "completed".  Previously the guard
+        # only checked for "active", so a completed session would be overwritten
+        # as "abandoned" (contact_collected=False path) on the second call.
+        if existing and existing.get("status") not in ("completed", "ended"):
             end_session(session_id, contact_collected=contact_collected)
 
         return jsonify({"status": "ended", "session_id": session_id}), 200
