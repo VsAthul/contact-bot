@@ -1,14 +1,18 @@
-"""
-Tool for validating an optional description or message.
-"""
-
 from langchain_core.tools import tool
 
 
 @tool
 def validate_description(description: str) -> dict:
     """
-    Validate an optional description or message from the user.
+    Validate an optional description/message.
+
+    Returns:
+        {
+            "is_valid": bool,
+            "reason": str | None,
+        }
+
+        Validate an optional description or message from the user.
 
     A valid description must:
     - If provided, contain at least 5 characters
@@ -23,17 +27,51 @@ def validate_description(description: str) -> dict:
             - is_valid (bool): Whether the description is valid or was intentionally skipped.
             - reason (str or None): Explanation if invalid.
     """
-    # Allow empty input as the description is optional
-    if not description or not description.strip():
-        return {"is_valid": True, "reason": None}
 
-    cleaned = description.strip()
+    try:
+        if description is None:
+            return {
+                "is_valid": True,
+                "reason": None,
+            }
 
-    # If provided, it must have some meaningful content
-    if len(cleaned) < 5:
-        return {
-            "is_valid": False,
-            "reason": "Description is too short. Please provide more details or type 'skip' to leave it blank"
+        text = str(description).strip()
+
+        # User intentionally skipped
+        skip_values = {
+            "skip",
+            "none",
+            "n/a",
+            "na",
+            "no",
+            "nothing",
+            "skip it",
+            "",
         }
 
-    return {"is_valid": True, "reason": None}
+        if text.lower() in skip_values:
+            return {
+                "is_valid": True,
+                "reason": None,
+            }
+
+        # Too short
+        if len(text) < 5:
+            return {
+                "is_valid": False,
+                "reason": (
+                    "Please provide a slightly more detailed description "
+                    "or type 'skip'."
+                ),
+            }
+
+        return {
+            "is_valid": True,
+            "reason": None,
+        }
+
+    except Exception as exc:
+        return {
+            "is_valid": False,
+            "reason": str(exc),
+        }

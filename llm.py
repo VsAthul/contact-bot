@@ -91,32 +91,42 @@ def get_tool_llm(tools: list) -> ChatGroq:
 
 
 # ── NEW ───────────────────────────────────────────────────────────────────────
-def get_validation_llm(tools: list) -> ChatGroq:
-    """
-    Create a ChatGroq LLM instance bound to the validation tools.
-    Uses temperature=0 so the model reliably picks the correct tool
-    rather than generating a free-form reply.
+from typing import Optional
 
-    The LLM is given the full list of validation tools and is expected
-    to respond with a tool_call (not plain text) for every invocation.
+
+def get_validation_llm(tools: list, tool_name: Optional[str] = None) -> ChatGroq:
+    """
+    Create a ChatGroq LLM instance bound to validation tools.
 
     Args:
-        tools: List of LangChain @tool objects (validate_name, validate_phone, …).
+        tools: List containing ONLY the required validation tool.
+        tool_name: Exact tool name to force during tool calling.
 
     Returns:
-        A ChatGroq instance that will respond with tool calls.
+        ChatGroq instance configured for deterministic validation.
     """
+
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError("GROQ_API_KEY environment variable is not set")
-
     llm = ChatGroq(
         model=GROQ_MODEL,
         api_key=api_key,
-        temperature=0.0,   # deterministic — must pick the right tool every time
+        temperature=0.0,
         max_tokens=256,
     )
-    return llm.bind_tools(tools, tool_choice="any")  # "any" forces a tool call
+
+    bind_kwargs = {}
+
+    if tool_name:
+        bind_kwargs["tool_choice"] = {
+            "type": "function",
+            "function": {
+                "name": tool_name
+            }
+        }
+
+    return llm.bind_tools(tools, **bind_kwargs)
 # ── END NEW ───────────────────────────────────────────────────────────────────
 
 
