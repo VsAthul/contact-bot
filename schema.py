@@ -28,13 +28,14 @@ def coerce_bool(v: Any) -> bool:
 
         lowered = v.strip().lower()
 
-        if lowered == "true":
+        if lowered == "true" or lowered == "yes" or lowered == "1":
             return True
 
-        if lowered == "false":
+        if lowered == "false" or lowered == "no" or lowered == "0":
             return False
+        else :
 
-        raise ValueError(f"Cannot coerce {v!r} to bool")
+            raise ValueError(f"Cannot coerce {v!r} to bool")
 
     return bool(v)
 
